@@ -1,0 +1,41 @@
+{
+  "model_name": "logistic_regression_v2",
+  "validation": {
+    "total_records": 22183,
+    "actual_churn_rate": 0.025469954469638914,
+    "average_predicted_probability": 0.028863514555523898,
+    "roc_auc": 0.6229671766481062,
+    "pr_auc": 0.038506473759983936,
+    "brier_score": 0.024715835052607868,
+    "precision_at_0_5": 0.0,
+    "recall_at_0_5": 0.0
+  },
+  "test": {
+    "total_records": 20539,
+    "actual_churn_rate": 0.026632260577438043,
+    "average_predicted_probability": 0.03100316689354294,
+    "roc_auc": 0.6413740999141888,
+    "pr_auc": 0.04267805629290782,
+    "brier_score": 0.02577353039546348,
+    "precision_at_0_5": 0.0,
+    "recall_at_0_5": 0.0
+  },
+  "features": [
+    "monthly_price",
+    "payment_failures",
+    "current_month_hours",
+    "current_month_sessions",
+    "previous_month_hours",
+    "usage_decline_percent",
+    "avg_usage_3_months",
+    "tenure_months",
+    "plan_name",
+    "usage_data_status"
+  ],
+  "priority_policy": {
+    "HIGH": "Top 10%",
+    "MEDIUM": "Next 20%",
+    "LOW": "Remaining 70%"
+  },
+  "limitations": "Trained on synthetic data. Relative review priorities are not absolute cancellation-risk categories."
+}

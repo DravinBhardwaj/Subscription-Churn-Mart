@@ -1,82 +1,65 @@
 
+import copy
+
 import pytest
 
-from app.generate_data import generate_data
+import app.generate_data as generator
 from app.validation import validate_data
 
 
-def sample_data():
-    return generate_data()
+@pytest.fixture
+def sample_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        generator, "DATA_DIR", tmp_path
+    )
+    return generator.generate_data(customer_count=50)
 
 
-def test_valid_data():
-    """Valid generated data should pass."""
-
-    customers, subscriptions, usage = sample_data()
-
-    assert validate_data(
-        customers, subscriptions, usage
-    ) is True
+def test_valid_data(sample_data):
+    assert validate_data(sample_data) is True
 
 
-def test_duplicate_customer():
-    """Duplicate customer IDs must be rejected."""
+def test_duplicate_customer(sample_data):
+    broken = copy.deepcopy(sample_data)
 
-    customers, subscriptions, usage = sample_data()
+    broken["customers"].append(
+        broken["customers"][0].copy()
+    )
 
-    customers.append(customers[0].copy())
-
-    with pytest.raises(
-        ValueError, match="Duplicate record"
-    ):
-        validate_data(
-            customers, subscriptions, usage
-        )
+    with pytest.raises(ValueError, match="Duplicate"):
+        validate_data(broken)
 
 
-def test_negative_usage():
-    """Negative usage hours must be rejected."""
+def test_negative_usage(sample_data):
+    broken = copy.deepcopy(sample_data)
 
-    customers, subscriptions, usage = sample_data()
-
-    usage[0]["usage_hours"] = -10
+    broken["monthly_usage"][0]["usage_hours"] = -10
 
     with pytest.raises(
-        ValueError, match="Usage hours"
+        ValueError, match="Invalid usage hours"
     ):
-        validate_data(
-            customers, subscriptions, usage
-        )
+        validate_data(broken)
 
 
-def test_invalid_subscription_status():
-    """Unsupported subscription statuses must fail."""
+def test_invalid_cancellation(sample_data):
+    broken = copy.deepcopy(sample_data)
 
-    customers, subscriptions, usage = sample_data()
-
-    subscriptions[0]["status"] = "unknown"
+    row = broken["subscription_monthly"][0]
+    row["cancelled_during_month"] = True
+    row["active_at_end"] = True
 
     with pytest.raises(
-        ValueError, match="Invalid subscription status"
+        ValueError, match="Invalid cancellation state"
     ):
-        validate_data(
-            customers, subscriptions, usage
-        )
+        validate_data(broken)
 
 
-def test_missing_usage_is_allowed():
-    """A missing monthly record is not zero usage."""
+def test_unknown_usage_customer(sample_data):
+    broken = copy.deepcopy(sample_data)
 
-    customers, subscriptions, usage = sample_data()
+    broken["monthly_usage"][0]["customer_id"] = 999999
 
-    customer_12_october = [
-        row for row in usage
-        if row["customer_id"] == 12
-        and row["month_start"] == "2026-10-01"
-    ]
-
-    assert len(customer_12_october) == 0
-
-    assert validate_data(
-        customers, subscriptions, usage
-    ) is True
+    with pytest.raises(
+        ValueError, match="no matching subscription"
+    ):
+        validate_data(broken)

@@ -8,291 +8,321 @@ from app.explanations import ai_explanation
 
 
 st.set_page_config(
-    page_title="Subscription Churn Mart",
+    page_title="Subscription Churn Intelligence",
     page_icon="📊",
     layout="wide",
 )
 
 
 @st.cache_data(ttl=60)
-def load_mart():
-    """Read the final analytics mart from PostgreSQL."""
-
-    query = text("""
-        SELECT
-            customer_id,
-            customer_name,
-            plan_name,
-            monthly_price,
-            subscription_status,
-            payment_failures,
-            previous_month_hours,
-            current_month_hours,
-            current_month_sessions,
-            usage_decline_percent,
-            usage_data_status,
-            decline_points,
-            payment_points,
-            low_activity_points,
-            risk_score,
-            risk_level
-        FROM customer_churn_mart
-        ORDER BY customer_id
-    """)
-
+def load_metrics():
     with engine.connect() as connection:
-        return pd.read_sql_query(query, connection)
+        return pd.read_sql_query(
+            text("""
+                SELECT *
+                FROM monthly_churn_metrics
+                ORDER BY month_start
+            """),
+            connection,
+        )
 
 
-def prepare_customer(row):
-    """Convert a Pandas record into a normal dictionary."""
+@st.cache_data(ttl=60)
+def load_predictions():
+    with engine.connect() as connection:
+        return pd.read_sql_query(
+            text("""
+                SELECT
+                    p.customer_id,
+                    c.customer_name,
+                    p.prediction_month,
+                    p.target_month,
+                    p.churn_probability,
+                    p.risk_level,
+                    p.model_name,
+                    f.plan_name,
+                    f.monthly_price,
+                    f.payment_failures,
+                    f.current_month_hours,
+                    f.current_month_sessions,
+                    f.previous_month_hours,
+                    f.usage_decline_percent,
+                    f.avg_usage_3_months,
+                    f.usage_data_status,
+                    f.tenure_months
 
+                FROM customer_risk_predictions p
+
+                JOIN customers c
+                  ON c.customer_id = p.customer_id
+
+                JOIN customer_churn_mart f
+                  ON f.customer_id = p.customer_id
+                 AND f.month_start = p.prediction_month
+
+                WHERE p.prediction_month = (
+                    SELECT MAX(prediction_month)
+                    FROM customer_risk_predictions
+                )
+
+                ORDER BY
+                    p.churn_probability DESC,
+                    p.customer_id
+            """),
+            connection,
+        )
+
+
+def format_customer(row):
     customer = row.to_dict()
 
     for key, value in customer.items():
         if pd.isna(value):
             customer[key] = None
+        elif hasattr(value, "item"):
+            customer[key] = value.item()
 
     return customer
 
 
 def main():
-    st.title("📊 Subscription Churn Mart")
+    st.title("📊 Subscription Churn Intelligence")
 
     st.write(
-        "A SQL-driven customer analytics system with "
-        "explainable churn-risk indicators."
+        "Historical churn analytics using PostgreSQL, "
+        "SQL feature engineering, Machine Learning "
+        "and Google Gemini."
     )
 
-    st.caption(
-        "Demonstration using synthetic customer data. "
-        "Risk levels are heuristic indicators, "
-        "not machine-learning probabilities."
+    st.info(
+        "The estimated probabilities come from a model "
+        "trained on synthetic data. HIGH, MEDIUM and LOW "
+        "are relative customer-review priorities, "
+        "not absolute probabilities."
     )
 
-    if st.button("Refresh analytics"):
-        load_mart.clear()
+    if st.button("Refresh Dashboard"):
+        load_metrics.clear()
+        load_predictions.clear()
         st.rerun()
 
     try:
-        df = load_mart()
+        metrics = load_metrics()
+        predictions = load_predictions()
 
     except Exception as error:
         st.error(
-            "Unable to load the analytics mart. "
-            "Check PostgreSQL and run the data pipeline."
+            "Could not load analytics. Run the SQL "
+            "pipeline and ML training first."
         )
         st.code(str(error))
         st.stop()
 
-    if df.empty:
-        st.warning(
-            "No data found. Run: python -m app.pipeline"
-        )
+    if metrics.empty or predictions.empty:
+        st.warning("No analytics results available.")
         st.stop()
 
-    # ---------------------------------------
-    # KPI METRICS
-    # ---------------------------------------
+    # Historical churn metrics
+    latest = metrics.iloc[-1]
 
-    total_customers = len(df)
+    st.subheader("Historical Churn Analytics")
 
-    churned_customers = int(
-        (df["subscription_status"] == "cancelled").sum()
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Customers at Start",
+        f"{int(latest['customers_at_start']):,}",
     )
 
-    active_customers = int(
-        (df["subscription_status"] == "active").sum()
+    c2.metric(
+        "Monthly Cancellations",
+        f"{int(latest['churned_customers']):,}",
     )
 
-    churn_rate = (
-        churned_customers / total_customers * 100
-        if total_customers > 0 else 0
+    c3.metric(
+        "Monthly Churn Rate",
+        f"{float(latest['churn_rate_percent']):.2f}%",
     )
 
-    st.subheader("Customer Overview")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Total Customers", total_customers)
-    col2.metric("Active Customers", active_customers)
-    col3.metric("Churned Customers", churned_customers)
-    col4.metric("Churn Rate", f"{churn_rate:.2f}%")
-
-    st.caption(
-        "Churn rate = cancelled customers / all "
-        "customers in this synthetic snapshot. "
-        "It is not a monthly churn rate."
+    c4.metric(
+        "Retention Rate",
+        f"{float(latest['retention_rate_percent']):.2f}%",
     )
 
-    st.divider()
-
-    # ---------------------------------------
-    # RISK DISTRIBUTION
-    # ---------------------------------------
-
-    st.subheader("Customer Risk Distribution")
-
-    active_df = df[
-        df["subscription_status"] == "active"
-    ].copy()
-
-    risk_order = [
-        "LOW",
-        "MEDIUM",
-        "HIGH",
-        "INSUFFICIENT DATA",
-    ]
-
-    risk_counts = (
-        active_df["risk_level"]
-        .value_counts()
-        .reindex(risk_order, fill_value=0)
+    st.metric(
+        "Lost Monthly Recurring Revenue",
+        f"₹{float(latest['lost_monthly_recurring_revenue']):,.2f}",
     )
+
+    trend = metrics.copy()
+
+    trend["month_start"] = pd.to_datetime(
+        trend["month_start"]
+    )
+
+    trend = trend.set_index("month_start")
 
     left, right = st.columns(2)
 
     with left:
-        st.write("Active Customers by Risk Level")
-        st.bar_chart(risk_counts)
+        st.write("Monthly Churn Rate (%)")
+        st.line_chart(trend["churn_rate_percent"])
 
     with right:
-        st.write("Usage Comparison")
-
-        usage_chart = active_df[
-            [
-                "customer_name",
-                "previous_month_hours",
-                "current_month_hours",
-            ]
-        ].copy()
-
-        usage_chart = usage_chart.set_index(
-            "customer_name"
-        )
-
-        st.bar_chart(usage_chart)
+        st.write("Monthly Cancellations")
+        st.bar_chart(trend["churned_customers"])
 
     st.divider()
 
-    # ---------------------------------------
-    # CUSTOMER TABLE
-    # ---------------------------------------
+    # Relative risk distribution
+    st.subheader("Next-Month Customer Review Priorities")
 
-    st.subheader("Customer Analytics Table")
-
-    risk_filter = st.selectbox(
-        "Filter by risk level",
-        [
-            "All",
-            "LOW",
-            "MEDIUM",
-            "HIGH",
-            "INSUFFICIENT DATA",
-            "CHURNED",
-        ],
+    st.write(
+        f"Prediction snapshot: "
+        f"{predictions['prediction_month'].iloc[0]}"
     )
 
-    filtered_df = df.copy()
+    st.write(
+        f"Target month: "
+        f"{predictions['target_month'].iloc[0]}"
+    )
 
-    if risk_filter != "All":
-        filtered_df = filtered_df[
-            filtered_df["risk_level"] == risk_filter
+    counts = predictions["risk_level"].value_counts()
+
+    high = int(counts.get("HIGH", 0))
+    medium = int(counts.get("MEDIUM", 0))
+    low = int(counts.get("LOW", 0))
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Customers Scored", f"{len(predictions):,}")
+    c2.metric("HIGH Priority", f"{high:,}")
+    c3.metric("MEDIUM Priority", f"{medium:,}")
+    c4.metric("LOW Priority", f"{low:,}")
+
+    priority_counts = (
+        counts.reindex(
+            ["HIGH", "MEDIUM", "LOW"],
+            fill_value=0,
+        )
+    )
+
+    st.bar_chart(priority_counts)
+
+    st.caption(
+        "HIGH = top 10% of predicted probabilities; "
+        "MEDIUM = next 20%; LOW = remaining 70%. "
+        "This is a customer-ranking policy rather "
+        "than a validated probability threshold."
+    )
+
+    st.divider()
+
+    # Customer risk table
+    st.subheader("Customer Predictions")
+
+    priority_filter = st.selectbox(
+        "Filter by review priority",
+        ["All", "HIGH", "MEDIUM", "LOW"],
+    )
+
+    filtered = predictions.copy()
+
+    if priority_filter != "All":
+        filtered = filtered[
+            filtered["risk_level"] == priority_filter
         ]
 
-    display_columns = [
-        "customer_id",
-        "customer_name",
-        "plan_name",
-        "subscription_status",
-        "usage_decline_percent",
-        "payment_failures",
-        "risk_score",
-        "risk_level",
-    ]
+    filtered["probability_percent"] = (
+        filtered["churn_probability"] * 100
+    ).round(2)
 
     st.dataframe(
-        filtered_df[display_columns],
+        filtered[
+            [
+                "customer_id",
+                "customer_name",
+                "plan_name",
+                "usage_decline_percent",
+                "payment_failures",
+                "probability_percent",
+                "risk_level",
+            ]
+        ].rename(columns={
+            "probability_percent":
+                "Estimated Cancellation %",
+            "risk_level": "Review Priority",
+        }),
         use_container_width=True,
         hide_index=True,
     )
 
     st.divider()
 
-    # ---------------------------------------
-    # CUSTOMER EXPLANATIONS
-    # ---------------------------------------
+    # Customer detail and Gemini
+    st.subheader("Customer Risk Explanation")
 
-    st.subheader("Explain Customer Risk")
-
-    customer_options = {
-        f"{row['customer_id']} - {row['customer_name']}":
-            row["customer_id"]
-        for _, row in df.iterrows()
+    customer_choices = {
+        f"{row.customer_id} - {row.customer_name}":
+            int(row.customer_id)
+        for row in predictions.itertuples()
     }
 
     selected_label = st.selectbox(
-        "Select a customer",
-        list(customer_options.keys()),
+        "Select customer",
+        list(customer_choices.keys()),
     )
 
-    selected_id = customer_options[selected_label]
+    customer_id = customer_choices[selected_label]
 
-    selected_row = df[
-        df["customer_id"] == selected_id
+    row = predictions[
+        predictions["customer_id"] == customer_id
     ].iloc[0]
 
-    customer = prepare_customer(selected_row)
+    customer = format_customer(row)
 
-    col1, col2, col3 = st.columns(3)
+    probability = float(
+        customer["churn_probability"]
+    )
 
-    col1.metric(
-        "Risk Classification",
+    c1, c2 = st.columns(2)
+
+    c1.metric(
+        "Estimated Next-Month Cancellation",
+        f"{probability * 100:.2f}%",
+    )
+
+    c2.metric(
+        "Relative Review Priority",
         customer["risk_level"],
     )
 
-    col2.metric(
-        "Risk Score",
-        str(customer["risk_score"]),
+    st.progress(
+        min(1.0, max(0.0, probability))
     )
 
-    decline = customer["usage_decline_percent"]
+    feature_names = [
+        "plan_name",
+        "monthly_price",
+        "payment_failures",
+        "current_month_hours",
+        "current_month_sessions",
+        "previous_month_hours",
+        "usage_decline_percent",
+        "avg_usage_3_months",
+        "usage_data_status",
+        "tenure_months",
+    ]
 
-    col3.metric(
-        "Usage Decline",
-        (
-            f"{float(decline):.1f}%"
-            if decline is not None
-            else "Unavailable"
-        ),
-    )
+    feature_table = pd.DataFrame([
+        {
+            "Feature": field,
+            "Value": customer.get(field),
+        }
+        for field in feature_names
+    ])
 
-    st.write("Engineered Customer Features")
-
-    feature_table = pd.DataFrame({
-        "Feature": [
-            "Subscription Status",
-            "Usage Data Status",
-            "Previous Month Hours",
-            "Current Month Hours",
-            "Current Month Sessions",
-            "Payment Failures",
-            "Decline Points",
-            "Payment Points",
-            "Activity Points",
-        ],
-        "Value": [
-            customer["subscription_status"],
-            customer["usage_data_status"],
-            customer["previous_month_hours"],
-            customer["current_month_hours"],
-            customer["current_month_sessions"],
-            customer["payment_failures"],
-            customer["decline_points"],
-            customer["payment_points"],
-            customer["low_activity_points"],
-        ],
-    })
+    st.write("SQL-Engineered Customer Features")
 
     st.dataframe(
         feature_table,
@@ -300,8 +330,8 @@ def main():
         hide_index=True,
     )
 
-    if st.button("Generate Risk Explanation"):
-        with st.spinner("Preparing explanation..."):
+    if st.button("Generate Gemini Explanation"):
+        with st.spinner("Generating explanation..."):
             explanation, source = ai_explanation(
                 customer
             )
@@ -314,13 +344,19 @@ def main():
     st.subheader("Methodology and Limitations")
 
     st.write(
-        "The system uses predefined SQL rules to "
-        "identify churn indicators. These risk scores "
-        "are not calibrated probabilities. Missing "
-        "usage is treated as insufficient evidence. "
-        "The demonstration dataset is synthetic, "
-        "and the risk thresholds require validation "
-        "before any real business use."
+        "SQL calculates the historical churn rate "
+        "and customer behavioral features. Logistic "
+        "Regression estimates future cancellation "
+        "probabilities using those features. "
+        "Relative priority bands rank customers for "
+        "review. Gemini provides narrative explanations "
+        "without changing the stored ML results."
+    )
+
+    st.warning(
+        "This demonstration uses synthetic data. "
+        "It is not a validated real-world churn "
+        "prediction or continuous live-monitoring system."
     )
 
 

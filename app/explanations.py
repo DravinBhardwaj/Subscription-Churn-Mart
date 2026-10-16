@@ -1,7 +1,8 @@
 
-import os
 import json
 import logging
+import os
+import re
 
 from google import genai
 from google.genai import types
@@ -11,38 +12,38 @@ from app.config import BASE_DIR
 
 logger = logging.getLogger(__name__)
 
+# Loading config also loads the .env file.
+_ = BASE_DIR
+
+
+ALLOWED_FIELDS = [
+    "plan_name",
+    "monthly_price",
+    "payment_failures",
+    "current_month_hours",
+    "current_month_sessions",
+    "previous_month_hours",
+    "usage_decline_percent",
+    "avg_usage_3_months",
+    "usage_data_status",
+    "tenure_months",
+    "churn_probability",
+    "risk_level",
+]
+
 
 def explanation_features(customer):
-    """
-    Select only SQL-engineered features.
-
-    Personal information such as customer name
-    and email must not be sent to Gemini.
-    """
-
-    allowed_fields = [
-        "subscription_status",
-        "plan_name",
-        "payment_failures",
-        "previous_month_hours",
-        "current_month_hours",
-        "current_month_sessions",
-        "usage_decline_percent",
-        "usage_data_status",
-        "decline_points",
-        "payment_points",
-        "low_activity_points",
-        "risk_score",
-        "risk_level",
-    ]
+    """Select approved SQL and ML features."""
 
     features = {}
 
-    for field in allowed_fields:
+    for field in ALLOWED_FIELDS:
         value = customer.get(field)
 
         if value is None:
             features[field] = None
+        elif isinstance(value, (str, int, float, bool)):
+            features[field] = value
         else:
             features[field] = str(value)
 
@@ -50,170 +51,204 @@ def explanation_features(customer):
 
 
 def rule_based_explanation(customer):
-    """
-    Generate an explanation using fixed business rules.
+    """Provide four sentences if Gemini is unavailable."""
 
-    This is used when Gemini is unavailable.
-    """
+    probability = customer.get("churn_probability")
+    risk = customer.get("risk_level", "UNKNOWN")
 
-    status = customer.get("subscription_status")
-    usage_status = customer.get("usage_data_status")
-    risk = customer.get("risk_level")
+    probability_text = (
+        f"{float(probability) * 100:.2f}%"
+        if probability is not None
+        else "an unavailable probability"
+    )
 
-    if status == "cancelled":
-        return (
-            "This customer has already cancelled "
-            "their subscription and is classified "
-            "as CHURNED."
-        )
+    sentence1 = (
+        f"The ML model estimates a {probability_text} "
+        "chance of cancellation during the next month."
+    )
 
-    if usage_status != "complete":
-        return (
-            "The customer's usage history is incomplete. "
-            "There is insufficient information to "
-            "reliably evaluate usage-based churn risk."
-        )
-
-    reasons = []
-
+    previous = customer.get("previous_month_hours")
+    current = customer.get("current_month_hours")
     decline = customer.get("usage_decline_percent")
 
-    if decline is not None and float(decline) >= 60:
-        reasons.append(
-            f"usage decreased by {float(decline):.1f}%"
+    if (
+        previous is not None
+        and current is not None
+        and decline is not None
+    ):
+        sentence2 = (
+            f"Customer usage changed from "
+            f"{float(previous):.2f} hours to "
+            f"{float(current):.2f} hours, "
+            f"representing a {float(decline):.2f}% decline."
+        )
+    else:
+        sentence2 = (
+            "The available usage history is incomplete, "
+            "so a reliable month-over-month usage "
+            "decline cannot be calculated."
         )
 
-    if int(customer.get("payment_failures", 0)) >= 1:
-        reasons.append(
-            "one or more subscription payments failed"
+    failures = int(customer.get("payment_failures") or 0)
+    sessions = customer.get("current_month_sessions")
+
+    if failures > 0:
+        sentence3 = (
+            f"The customer recorded {failures} failed "
+            "payment(s), which is an additional "
+            "feature considered by the model."
+        )
+    elif sessions is not None:
+        sentence3 = (
+            f"The customer recorded {int(sessions)} "
+            "sessions during the current reporting month."
+        )
+    else:
+        sentence3 = (
+            "Available payment and engagement features "
+            "provide additional context for the estimate."
         )
 
-    if int(customer.get("current_month_sessions", 0)) <= 2:
-        reasons.append(
-            "the customer had at most two sessions "
-            "during the current month"
-        )
+    sentence4 = (
+        f"The customer belongs to the {risk} relative-priority "
+        "group based on their ranking among active customers; "
+        "the model was trained on synthetic data, so its "
+        "probabilities are not validated for real-world use."
+    )
 
-    if not reasons:
-        return (
-            "No configured risk indicators were triggered. "
-            "The customer is classified as LOW risk "
-            "under the current business rules."
+    return " ".join([
+        sentence1,
+        sentence2,
+        sentence3,
+        sentence4,
+    ])
+
+
+def valid_explanation(answer):
+    """Reject empty, incomplete or truncated responses."""
+
+    if not isinstance(answer, str):
+        return False
+
+    answer = answer.strip()
+
+    if not 140 <= len(answer) <= 2500:
+        return False
+
+    if not answer.endswith((".", "!", "?")):
+        return False
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(
+            r"(?<=[.!?])\s+",
+            answer,
         )
+        if sentence.strip()
+    ]
 
     return (
-        f"The customer is classified as {risk} risk "
-        f"because {'; '.join(reasons)}. "
-        "This classification is based on predefined "
-        "SQL indicators, not a predicted probability."
+        3 <= len(sentences) <= 4
+        and all(
+            len(sentence.split()) >= 6
+            for sentence in sentences
+        )
     )
 
 
 def ai_explanation(customer):
-    """
-    Generate an explanation using Google Gemini.
-
-    Returns:
-        explanation: Generated or fallback text
-        source: Origin of the explanation
-    """
+    """Generate a Gemini explanation using engineered features."""
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
 
-    # Step 1: Check whether an API key is provided.
     if not api_key:
         return (
             rule_based_explanation(customer),
-            "Rule-based explanation (Gemini key missing)",
+            "Rule-based fallback: API key missing",
         )
 
-    # Step 2: Handle cancelled or incomplete records
-    # deterministically.
-    if customer.get("risk_level") in (
-        "CHURNED",
-        "INSUFFICIENT DATA",
-    ):
-        return (
-            rule_based_explanation(customer),
-            "Rule-based explanation",
-        )
-
-    # Step 3: Extract approved engineered features.
     features = explanation_features(customer)
 
-    # Step 4: Prepare the Gemini prompt.
+    probability = customer.get("churn_probability")
+
+    if probability is None:
+        return (
+            rule_based_explanation(customer),
+            "Rule-based fallback: probability unavailable",
+        )
+
     prompt = f"""
-Explain the following subscription customer's churn risk.
+Explain this subscription churn prediction.
 
-The customer's engineered features are:
-
+Engineered SQL and ML features:
 {json.dumps(features, indent=2)}
 
-Instructions:
+The HIGH/MEDIUM/LOW labels represent relative priority,
+not absolute cancellation probability.
 
-1. Explain the customer's risk in 2 to 4 simple sentences.
-2. Use only the engineered features provided above.
-3. Explain the role of usage decline, payment failures,
-   and customer engagement when relevant.
-4. Do not invent personal information or missing values.
-5. Do not invent churn probabilities.
-6. Do not change the provided risk classification.
-7. Do not claim that the indicators prove causation.
-8. Clearly explain why the customer was assigned
-   the existing risk level.
+HIGH = top 10% by predicted probability.
+MEDIUM = next 20%.
+LOW = remaining 70%.
 
-Return only the explanation.
+Write EXACTLY FOUR complete sentences:
+
+1. State the estimated cancellation probability
+   and relative priority.
+2. Explain the change in usage hours and percentage.
+3. Explain sessions and payment failures.
+4. Discuss the interpretation and limitations.
+
+Rules:
+- Use only provided values.
+- Do not invent information.
+- Do not change the risk category or probability.
+- Do not make unsupported causal claims.
+- Mention that the model uses synthetic training data.
+- Do not use bullet points or headings.
 """
 
-    # Step 5: Send the prompt to Gemini.
     try:
         client = genai.Client(api_key=api_key)
 
         response = client.models.generate_content(
             model=os.getenv(
                 "GEMINI_MODEL",
-                "gemini-3.8-flash"
+                "gemini-2.5-flash",
             ),
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.2,
-                max_output_tokens=300,
+                max_output_tokens=800,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=0
+                ),
                 system_instruction=(
-                    "You are a customer analytics assistant. "
-                    "Explain subscription churn indicators "
-                    "clearly and accurately. "
-                    "Use only the supplied engineered "
-                    "customer features."
+                    "You are an analytics assistant. "
+                    "Explain only the supplied evidence "
+                    "using complete and simple sentences."
                 ),
             ),
         )
 
-        explanation = response.text
+        answer = response.text
 
-        # Step 6: Check for an empty or invalid response.
-        if not isinstance(explanation, str):
-            raise ValueError("Invalid Gemini response")
-
-        explanation = explanation.strip()
-
-        if not explanation or len(explanation) > 1500:
-            raise ValueError(
-                "Gemini returned an empty or oversized response"
+        if not valid_explanation(answer):
+            logger.warning(
+                "Gemini returned an incomplete explanation"
+            )
+            return (
+                rule_based_explanation(customer),
+                "Rule-based fallback: incomplete response",
             )
 
-        return (
-            explanation,
-            "Google Gemini AI explanation",
-        )
+        return answer.strip(), "Google Gemini AI"
 
     except Exception as error:
-        # Log the error without exposing the API key.
         logger.warning(
-            "Gemini explanation failed: %s",
+            "Gemini failed: %s",
             type(error).__name__,
         )
-
         return (
             rule_based_explanation(customer),
-            "Rule-based fallback (Gemini unavailable)",
+            "Rule-based fallback: Gemini unavailable",
         )
