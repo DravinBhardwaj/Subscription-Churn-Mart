@@ -5,5 +5,5 @@ __pycache__/
 *.pyc
 .env
 .streamlit/
-.DS_Store
+models/*.joblib
 data/*.csv

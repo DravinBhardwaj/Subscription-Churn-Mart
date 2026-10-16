@@ -1,6 +1,5 @@
 
 CREATE OR REPLACE VIEW stg_customers AS
-
 SELECT
     customer_id,
     customer_name,

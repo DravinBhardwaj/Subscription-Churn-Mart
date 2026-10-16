@@ -1,16 +1,24 @@
 
 import os
+import json
+import logging
 
-import requests
+from google import genai
+from google.genai import types
 
 from app.config import BASE_DIR
 
-# Importing config also loads environment variables.
-_ = BASE_DIR
+
+logger = logging.getLogger(__name__)
 
 
 def explanation_features(customer):
-    """Allow only engineered features into the AI prompt."""
+    """
+    Select only SQL-engineered features.
+
+    Personal information such as customer name
+    and email must not be sent to Gemini.
+    """
 
     allowed_fields = [
         "subscription_status",
@@ -33,10 +41,8 @@ def explanation_features(customer):
     for field in allowed_fields:
         value = customer.get(field)
 
-        # Convert Pandas / Decimal values to plain text
-        # before sending the structured prompt.
         if value is None:
-            features[field] = "unknown"
+            features[field] = None
         else:
             features[field] = str(value)
 
@@ -44,7 +50,11 @@ def explanation_features(customer):
 
 
 def rule_based_explanation(customer):
-    """Provide a transparent explanation without an API."""
+    """
+    Generate an explanation using fixed business rules.
+
+    This is used when Gemini is unavailable.
+    """
 
     status = customer.get("subscription_status")
     usage_status = customer.get("usage_data_status")
@@ -52,17 +62,16 @@ def rule_based_explanation(customer):
 
     if status == "cancelled":
         return (
-            "This customer has already cancelled the "
-            "subscription. They are counted as churned, "
-            "not as an active customer at risk."
+            "This customer has already cancelled "
+            "their subscription and is classified "
+            "as CHURNED."
         )
 
     if usage_status != "complete":
         return (
-            "Usage history is incomplete, so the system "
-            "cannot reliably assess usage decline. "
-            "Review the missing usage records before "
-            "assigning a behavioral churn-risk level."
+            "The customer's usage history is incomplete. "
+            "There is insufficient information to "
+            "reliably evaluate usage-based churn risk."
         )
 
     reasons = []
@@ -82,118 +91,129 @@ def rule_based_explanation(customer):
     if int(customer.get("current_month_sessions", 0)) <= 2:
         reasons.append(
             "the customer had at most two sessions "
-            "in the current month"
+            "during the current month"
         )
 
     if not reasons:
         return (
             "No configured risk indicators were triggered. "
-            "The customer is classified as LOW risk under "
-            "the current rules. This does not guarantee "
-            "that the customer will remain subscribed."
+            "The customer is classified as LOW risk "
+            "under the current business rules."
         )
 
     return (
         f"The customer is classified as {risk} risk "
-        f"because " + "; ".join(reasons) + ". "
-        "This is an indicator-based assessment, "
-        "not a statistically calibrated prediction."
+        f"because {'; '.join(reasons)}. "
+        "This classification is based on predefined "
+        "SQL indicators, not a predicted probability."
     )
 
 
 def ai_explanation(customer):
-    """Use an LLM, with a safe local fallback."""
+    """
+    Generate an explanation using Google Gemini.
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    Returns:
+        explanation: Generated or fallback text
+        source: Origin of the explanation
+    """
 
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    # Step 1: Check whether an API key is provided.
     if not api_key:
+        return (
+            rule_based_explanation(customer),
+            "Rule-based explanation (Gemini key missing)",
+        )
+
+    # Step 2: Handle cancelled or incomplete records
+    # deterministically.
+    if customer.get("risk_level") in (
+        "CHURNED",
+        "INSUFFICIENT DATA",
+    ):
         return (
             rule_based_explanation(customer),
             "Rule-based explanation",
         )
 
+    # Step 3: Extract approved engineered features.
     features = explanation_features(customer)
 
-    prompt = (
-        "Explain this subscription customer's churn "
-        "status or risk in 2 to 4 simple sentences.\n"
-        "Use ONLY the provided engineered features.\n"
-        "Do not invent facts, probabilities, causes, "
-        "or customer personal details.\n"
-        "Do not change the supplied risk label.\n"
-        "A cancelled subscription is actual churn.\n"
-        "Missing usage means insufficient evidence.\n"
-        "The score is a heuristic, not a probability.\n\n"
-        f"Engineered features:\n{features}"
-    )
+    # Step 4: Prepare the Gemini prompt.
+    prompt = f"""
+Explain the following subscription customer's churn risk.
 
-    payload = {
-        "model": os.getenv(
-            "OPENAI_MODEL", "gpt-4o-mini"
-        ),
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You explain analytics results clearly. "
-                    "You must not invent unsupported facts."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "temperature": 0.2,
-        "max_tokens": 180,
-    }
+The customer's engineered features are:
 
+{json.dumps(features, indent=2)}
+
+Instructions:
+
+1. Explain the customer's risk in 2 to 4 simple sentences.
+2. Use only the engineered features provided above.
+3. Explain the role of usage decline, payment failures,
+   and customer engagement when relevant.
+4. Do not invent personal information or missing values.
+5. Do not invent churn probabilities.
+6. Do not change the provided risk classification.
+7. Do not claim that the indicators prove causation.
+8. Clearly explain why the customer was assigned
+   the existing risk level.
+
+Return only the explanation.
+"""
+
+    # Step 5: Send the prompt to Gemini.
     try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=20,
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model=os.getenv(
+                "GEMINI_MODEL",
+                "gemini-3.8-flash"
+            ),
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=300,
+                system_instruction=(
+                    "You are a customer analytics assistant. "
+                    "Explain subscription churn indicators "
+                    "clearly and accurately. "
+                    "Use only the supplied engineered "
+                    "customer features."
+                ),
+            ),
         )
 
-        response.raise_for_status()
+        explanation = response.text
 
-        answer = response.json()["choices"][0][
-            "message"
-        ]["content"]
+        # Step 6: Check for an empty or invalid response.
+        if not isinstance(explanation, str):
+            raise ValueError("Invalid Gemini response")
 
-        if not isinstance(answer, str):
-            raise ValueError("AI returned invalid content")
+        explanation = explanation.strip()
 
-        answer = answer.strip()
-
-        if not answer or len(answer) > 1500:
-            raise ValueError("AI response failed validation")
-
-        # A local fallback is used for the most sensitive
-        # classification states rather than asking the LLM
-        # to reason about missing data or confirmed churn.
-        if customer.get("risk_level") in (
-            "CHURNED", "INSUFFICIENT DATA"
-        ):
-            return (
-                rule_based_explanation(customer),
-                "Rule-based explanation",
+        if not explanation or len(explanation) > 1500:
+            raise ValueError(
+                "Gemini returned an empty or oversized response"
             )
 
-        return answer, "AI-generated explanation"
+        return (
+            explanation,
+            "Google Gemini AI explanation",
+        )
 
-    except (
-        requests.RequestException,
-        KeyError,
-        IndexError,
-        TypeError,
-        ValueError,
-    ):
+    except Exception as error:
+        # Log the error without exposing the API key.
+        logger.warning(
+            "Gemini explanation failed: %s",
+            type(error).__name__,
+        )
+
         return (
             rule_based_explanation(customer),
-            "Rule-based fallback (AI unavailable)",
+            "Rule-based fallback (Gemini unavailable)",
         )

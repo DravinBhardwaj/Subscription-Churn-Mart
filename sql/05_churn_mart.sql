@@ -1,82 +1,62 @@
 
 CREATE OR REPLACE VIEW customer_churn_mart AS
 
-WITH customer_features AS (
+WITH features AS (
     SELECT
         c.customer_id,
         c.customer_name,
-        c.join_date,
-
+        s.month_start,
         s.plan_name,
         s.monthly_price,
-        s.subscription_status,
+        s.active_at_start,
+        s.active_at_end,
+        s.cancelled_during_month,
         s.payment_failures,
-        s.is_churned,
 
-        u.previous_month_hours,
         u.current_month_hours,
         u.current_month_sessions,
+        u.previous_month_hours,
+        u.two_months_ago_hours,
         u.usage_decline_percent,
+        u.avg_usage_3_months,
         u.usage_data_status,
 
-        CASE
-            WHEN u.usage_data_status <> 'complete'
-                THEN 0
-            WHEN u.usage_decline_percent >= 60
-                THEN 2
-            ELSE 0
-        END AS decline_points,
-
-        CASE
-            WHEN s.payment_failures >= 1 THEN 1
-            ELSE 0
-        END AS payment_points,
-
-        CASE
-            WHEN u.usage_data_status = 'complete'
-             AND u.current_month_sessions <= 2
-                THEN 1
-            ELSE 0
-        END AS low_activity_points
-
-    FROM stg_customers c
-
-    INNER JOIN stg_subscriptions s
-        ON c.customer_id = s.customer_id
-
-    LEFT JOIN stg_usage u
-        ON c.customer_id = u.customer_id
-),
-
-risk_scores AS (
-    SELECT
-        *,
         (
-            decline_points
-            + payment_points
-            + low_activity_points
-        ) AS risk_score
+            (EXTRACT(YEAR FROM AGE(
+                s.month_start, c.join_date
+            )) * 12)
+            + EXTRACT(MONTH FROM AGE(
+                s.month_start, c.join_date
+            ))
+        )::INTEGER AS tenure_months
 
-    FROM customer_features
+    FROM stg_subscriptions s
+    JOIN stg_customers c
+        ON c.customer_id = s.customer_id
+    JOIN stg_usage u
+        ON u.customer_id = s.customer_id
+       AND u.month_start = s.month_start
 )
 
 SELECT
-    *,
+    f.*,
+
+    -- This label belongs to the NEXT month.
+    -- It must never be used as an input feature.
+    next_s.cancelled_during_month::INTEGER
+        AS churn_next_month,
 
     CASE
-        WHEN subscription_status = 'cancelled'
-            THEN 'CHURNED'
+        WHEN next_s.customer_id IS NULL
+        THEN FALSE
+        ELSE TRUE
+    END AS has_future_label
 
-        WHEN usage_data_status <> 'complete'
-            THEN 'INSUFFICIENT DATA'
+FROM features f
 
-        WHEN risk_score >= 3
-            THEN 'HIGH'
+LEFT JOIN stg_subscriptions next_s
+    ON next_s.customer_id = f.customer_id
+   AND next_s.month_start =
+       (f.month_start + INTERVAL '1 month')::date
 
-        WHEN risk_score >= 1
-            THEN 'MEDIUM'
-
-        ELSE 'LOW'
-    END AS risk_level
-
-FROM risk_scores;
+WHERE f.active_at_end = TRUE;
