@@ -780,14 +780,6 @@ Customers are ranked using predicted probabilities so that review priorities rem
 
 ---
 
-## 🎥 Demo Video
-
-**5–8 minute technical assessment demo:** Add the accessible video link here.
-
-The video should demonstrate the architecture, SQL transformations, ML results, Gemini explanation, tests and an edge case.
-
----
-
 ## 📌 Conclusion
 
 Subscription Churn Mart V3 demonstrates an end-to-end analytics engineering workflow combining relational data modeling, SQL feature engineering, historical churn analysis, Machine Learning and AI-assisted explanations.
