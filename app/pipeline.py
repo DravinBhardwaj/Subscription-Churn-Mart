@@ -1,11 +1,9 @@
 
-import csv
 from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import text
 
-from app.config import BASE_DIR
 from app.database import (
     engine,
     check_connection,
@@ -15,263 +13,214 @@ from app.generate_data import generate_data
 from app.validation import validate_data
 
 
-SQL_FILES = [
+MODEL_FILES = [
     "02_customer_model.sql",
     "03_subscription_model.sql",
     "04_usage_model.sql",
     "05_churn_mart.sql",
+    "06_monthly_metrics.sql",
 ]
 
-
-def read_csv(filename):
-    """Read generated sample data."""
-
-    path = BASE_DIR / "data" / filename
-
-    with path.open(
-        "r", newline="", encoding="utf-8"
-    ) as file:
-        return list(csv.DictReader(file))
+BATCH_SIZE = 5000
 
 
-def create_tables():
-    """Create database tables if necessary."""
-
-    sql = read_sql_file("01_schema.sql")
-
-    # Our schema file contains simple SQL statements.
-    statements = [
-        statement.strip()
-        for statement in sql.split(";")
-        if statement.strip()
-    ]
-
-    with engine.begin() as connection:
-        for statement in statements:
-            connection.execute(text(statement))
-
-    print("Database tables are ready.")
-
-
-def load_data(customers, subscriptions, usage):
-    """Insert or update source records atomically."""
-
-    customer_sql = text("""
-        INSERT INTO customers (
-            customer_id, customer_name, join_date
-        )
-        VALUES (
-            :customer_id, :customer_name, :join_date
-        )
-        ON CONFLICT (customer_id)
-        DO UPDATE SET
-            customer_name = EXCLUDED.customer_name,
-            join_date = EXCLUDED.join_date
-    """)
-
-    subscription_sql = text("""
-        INSERT INTO subscriptions (
-            subscription_id, customer_id,
-            plan_name, monthly_price,
-            status, payment_failures
-        )
-        VALUES (
-            :subscription_id, :customer_id,
-            :plan_name, :monthly_price,
-            :status, :payment_failures
-        )
-        ON CONFLICT (subscription_id)
-        DO UPDATE SET
-            customer_id = EXCLUDED.customer_id,
-            plan_name = EXCLUDED.plan_name,
-            monthly_price = EXCLUDED.monthly_price,
-            status = EXCLUDED.status,
-            payment_failures = EXCLUDED.payment_failures
-    """)
-
-    usage_sql = text("""
-        INSERT INTO monthly_usage (
-            customer_id, month_start,
-            usage_hours, session_count
-        )
-        VALUES (
-            :customer_id, :month_start,
-            :usage_hours, :session_count
-        )
-        ON CONFLICT (customer_id, month_start)
-        DO UPDATE SET
-            usage_hours = EXCLUDED.usage_hours,
-            session_count = EXCLUDED.session_count
-    """)
-
-    customer_records = [
+def prepare_rows(data):
+    customers = [
         {
-            "customer_id": int(row["customer_id"]),
-            "customer_name": row["customer_name"],
+            **row,
             "join_date": date.fromisoformat(
                 row["join_date"]
             ),
         }
-        for row in customers
+        for row in data["customers"]
     ]
 
-    subscription_records = [
+    subscriptions = [
         {
-            "subscription_id": int(row["subscription_id"]),
-            "customer_id": int(row["customer_id"]),
-            "plan_name": row["plan_name"],
+            **row,
             "monthly_price": Decimal(
                 str(row["monthly_price"])
             ),
-            "status": row["status"],
-            "payment_failures": int(
-                row["payment_failures"]
-            ),
         }
-        for row in subscriptions
+        for row in data["subscriptions"]
     ]
 
-    usage_records = [
+    history = [
         {
-            "customer_id": int(row["customer_id"]),
+            **row,
+            "month_start": date.fromisoformat(
+                row["month_start"]
+            ),
+        }
+        for row in data["subscription_monthly"]
+    ]
+
+    usage = [
+        {
+            **row,
             "month_start": date.fromisoformat(
                 row["month_start"]
             ),
             "usage_hours": Decimal(
                 str(row["usage_hours"])
             ),
-            "session_count": int(
-                row["session_count"]
-            ),
         }
-        for row in usage
+        for row in data["monthly_usage"]
     ]
 
-    # A single transaction commits all inserts together.
-    # If one fails, PostgreSQL rolls back this load.
-    with engine.begin() as connection:
+    return customers, subscriptions, history, usage
+
+
+def insert_batches(connection, statement, rows):
+    for index in range(0, len(rows), BATCH_SIZE):
         connection.execute(
-            customer_sql, customer_records
-        )
-        connection.execute(
-            subscription_sql, subscription_records
-        )
-        connection.execute(
-            usage_sql, usage_records
+            text(statement),
+            rows[index:index + BATCH_SIZE],
         )
 
-    print("Sample data loaded successfully.")
+
+def create_schema():
+    script = read_sql_file("01_schema.sql")
+
+    with engine.begin() as connection:
+        for command in script.split(";"):
+            if command.strip():
+                connection.execute(text(command.strip()))
+
+    print("Database schema ready.")
+
+
+def load_data(data):
+    customers, subscriptions, history, usage = (
+        prepare_rows(data)
+    )
+
+    queries = [
+        """
+        INSERT INTO customers
+            (customer_id, customer_name, join_date)
+        VALUES
+            (:customer_id, :customer_name, :join_date)
+        ON CONFLICT (customer_id) DO UPDATE SET
+            customer_name = EXCLUDED.customer_name,
+            join_date = EXCLUDED.join_date
+        """,
+        """
+        INSERT INTO subscriptions
+            (subscription_id, customer_id,
+             plan_name, monthly_price)
+        VALUES
+            (:subscription_id, :customer_id,
+             :plan_name, :monthly_price)
+        ON CONFLICT (subscription_id) DO UPDATE SET
+            plan_name = EXCLUDED.plan_name,
+            monthly_price = EXCLUDED.monthly_price
+        """,
+        """
+        INSERT INTO subscription_monthly
+            (customer_id, month_start, active_at_start,
+             cancelled_during_month, active_at_end,
+             payment_failures)
+        VALUES
+            (:customer_id, :month_start, :active_at_start,
+             :cancelled_during_month, :active_at_end,
+             :payment_failures)
+        ON CONFLICT (customer_id, month_start)
+        DO UPDATE SET
+            active_at_start = EXCLUDED.active_at_start,
+            cancelled_during_month =
+                EXCLUDED.cancelled_during_month,
+            active_at_end = EXCLUDED.active_at_end,
+            payment_failures = EXCLUDED.payment_failures
+        """,
+        """
+        INSERT INTO monthly_usage
+            (customer_id, month_start,
+             usage_hours, session_count)
+        VALUES
+            (:customer_id, :month_start,
+             :usage_hours, :session_count)
+        ON CONFLICT (customer_id, month_start)
+        DO UPDATE SET
+            usage_hours = EXCLUDED.usage_hours,
+            session_count = EXCLUDED.session_count
+        """,
+    ]
+
+    # Commit the source load as one transaction.
+    with engine.begin() as connection:
+        for query, rows in zip(
+            queries, [customers, subscriptions, history, usage]
+        ):
+            insert_batches(connection, query, rows)
+
+    print("Source data loaded.")
 
 
 def create_models():
-    """Build SQL analytical views in dependency order."""
-
     with engine.begin() as connection:
-        for filename in SQL_FILES:
-            sql = read_sql_file(filename)
-            connection.execute(text(sql))
-
-            print(f"Created SQL model: {filename}")
-
-
-def validate_mart():
-    """Check important properties of the final mart."""
-
-    with engine.connect() as connection:
-        source_count = connection.execute(
-            text("SELECT COUNT(*) FROM customers")
-        ).scalar_one()
-
-        mart_count = connection.execute(
-            text(
-                "SELECT COUNT(*) "
-                "FROM customer_churn_mart"
+        for filename in MODEL_FILES:
+            connection.execute(
+                text(read_sql_file(filename))
             )
+            print(f"Created: {filename}")
+
+
+def validate_output():
+    with engine.connect() as connection:
+        monthly = connection.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM monthly_churn_metrics
+            """)
         ).scalar_one()
 
-        duplicate_count = connection.execute(
+        bad_balance = connection.execute(
+            text("""
+                SELECT COUNT(*)
+                FROM monthly_churn_metrics
+                WHERE customers_at_start <>
+                    customers_at_end + churned_customers
+            """)
+        ).scalar_one()
+
+        duplicate_features = connection.execute(
             text("""
                 SELECT COUNT(*)
                 FROM (
-                    SELECT customer_id
+                    SELECT customer_id, month_start
                     FROM customer_churn_mart
-                    GROUP BY customer_id
+                    GROUP BY customer_id, month_start
                     HAVING COUNT(*) > 1
-                ) duplicates
+                ) d
             """)
         ).scalar_one()
 
-        invalid_risk_count = connection.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM customer_churn_mart
-                WHERE risk_level NOT IN (
-                    'LOW', 'MEDIUM', 'HIGH',
-                    'CHURNED', 'INSUFFICIENT DATA'
-                )
-            """)
-        ).scalar_one()
+    assert monthly == 18, "Expected 18 months"
+    assert bad_balance == 0, "Customer totals do not balance"
+    assert duplicate_features == 0, "Duplicate feature rows"
 
-        incorrect_churn_count = connection.execute(
-            text("""
-                SELECT COUNT(*)
-                FROM customer_churn_mart
-                WHERE (
-                    subscription_status = 'cancelled'
-                    AND risk_level <> 'CHURNED'
-                )
-                OR (
-                    subscription_status = 'active'
-                    AND risk_level = 'CHURNED'
-                )
-            """)
-        ).scalar_one()
-
-    assert source_count > 0, "No customers loaded"
-    assert mart_count == source_count, (
-        "Mart must contain one row per customer"
-    )
-    assert duplicate_count == 0, (
-        "Duplicate customers found in mart"
-    )
-    assert invalid_risk_count == 0, (
-        "Invalid risk labels found"
-    )
-    assert incorrect_churn_count == 0, (
-        "Churn status and risk label disagree"
-    )
-
-    print(f"Mart validation passed: {mart_count} customers")
+    print("SQL validation passed.")
 
 
 def main():
-    print("Starting Subscription Churn Mart pipeline...")
+    print("Starting Subscription Churn Mart V3...")
 
     if not check_connection():
-        raise ConnectionError(
-            "Unable to connect to PostgreSQL"
-        )
+        raise RuntimeError("PostgreSQL connection failed")
 
-    print("PostgreSQL connection successful.")
+    print("PostgreSQL connected.")
 
-    # Generate sample CSV files.
-    generate_data()
+    data = generate_data()
+    validate_data(data)
+    print("Source validation passed.")
 
-    # Read generated files.
-    customers = read_csv("customers.csv")
-    subscriptions = read_csv("subscriptions.csv")
-    usage = read_csv("monthly_usage.csv")
-
-    # Validate before inserting anything.
-    validate_data(customers, subscriptions, usage)
-    print("Source data validation passed.")
-
-    create_tables()
-    load_data(customers, subscriptions, usage)
+    create_schema()
+    load_data(data)
     create_models()
-    validate_mart()
+    validate_output()
 
-    print("Pipeline completed successfully!")
+    print("SQL pipeline completed successfully.")
 
 
 if __name__ == "__main__":
